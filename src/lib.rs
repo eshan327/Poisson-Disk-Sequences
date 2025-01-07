@@ -14,10 +14,8 @@ static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
 #[wasm_bindgen]
 pub struct Point(pub usize, pub usize);
 
-#[wasm_bindgen]
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Cell {
+// Cell states for the Poisson Disk Sampling algorithm
+enum Cell {
     // No object at this location
     EMPTY = 0,
     // No longer on the active list
@@ -36,9 +34,9 @@ pub struct PoissonDisk {
     cells: Vec<Cell>,
     radius: u32,
     num_samples: u32,
-    // Grid used to determine point sampling.
+    // Grid used to determine point sampling
     grid: Vec<Option<(usize, usize)>>,
-    // List of points we want to generate more points around.
+    // List of points we want to generate more points around
     active: Vec<(usize, usize)>,
     samples: Vec<Point>,
 }
@@ -46,43 +44,30 @@ pub struct PoissonDisk {
 #[wasm_bindgen]
 impl PoissonDisk {
     pub fn new(width: u32, height: u32, radius: u32, num_samples: u32) -> Self {
+        // Initialize cells with EMPTY state
         let cells = vec![Cell::EMPTY; (width * height) as usize];
 
-        // Step 0
-        // Initialize an n-dimensional background grid for storing samples
-
-        // We choose cell size to be radius / (dimensions) so that we
+        // Step 0: Initialize an n-dimensional background grid for storing samples
+        // We choose cell size to be radius / sqrt(dimensions) so that we
         // are guaranteed to have at most one point in any given cell.
-        let cell_size = radius as f64 / (2.0 as f64).sqrt();
+        let cell_size = radius as f64 / (2.0_f64).sqrt();
         let cell_width = (width as f64 / cell_size).ceil() + 1.0;
         let cell_height = (height as f64 / cell_size).ceil() + 1.0;
         let grid = vec![None; (cell_width * cell_height) as usize];
 
-        let mut disk = PoissonDisk {
+        PoissonDisk {
             width,
             height,
-            cells,
             cell_size,
             cell_width,
             cell_height,
-            grid,
+            cells,
             radius,
             num_samples,
+            grid,
             active: Vec::new(),
             samples: Vec::new(),
-        };
-
-        // Step 1
-        // Select the initial sample to be randomly chosen uniformly in the domain.
-        let point = (
-            (Math::random() * width as f64) as usize,
-            (Math::random() * height as f64) as usize,
-        );
-
-        disk.insert_point(point);
-        disk.active.push(point);
-
-        disk
+        }
     }
 
     fn distance(&self, pa: (usize, usize), pb: (usize, usize)) -> f64 {
