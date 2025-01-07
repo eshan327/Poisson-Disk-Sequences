@@ -1,249 +1,207 @@
-extern crate glutin_window;
-extern crate graphics;
-extern crate opengl_graphics;
-extern crate piston;
-extern crate rand;
+mod utils;
 
-use opengl_graphics::{GlyphCache, TextureSettings};
-use piston::input::*;
+use js_sys::Math;
+use wasm_bindgen::prelude::*;
 
-mod color;
-mod geom;
-mod gfx;
-mod models;
-pub mod config;
+const PI: f64 = 3.141529;
 
-use crate::gfx::utils::{draw_center, draw_text};
-use crate::models::{GameObject};
-use crate::models::bullet::Bullet;
-use crate::models::enemy::Enemy;
-use crate::models::player::Player;
+// When the `wee_alloc` feature is enabled, use `wee_alloc` as the global
+// allocator.
+#[cfg(feature = "wee_alloc")]
+#[global_allocator]
+static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
 
-const FIRE_COOLDOWN: f64 = 0.1; // Only allow user to shoot 10 bullets/sec.
+#[wasm_bindgen]
+pub struct Point(pub usize, pub usize);
 
-enum GameStatus {
-    // Normal fighting mode
-    Normal,
-    // Player died
-    Died,
-    // Player won!
-    Win,
+#[wasm_bindgen]
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cell {
+    // No object at this location
+    EMPTY = 0,
+    // No longer on the active list
+    DEAD = 1,
+    // In the active list (used to generate additional points)
+    ACTIVE = 2,
 }
 
-struct GameState {
-    debug_mode: bool,
-    // Overall game state
-    game_status: GameStatus,
-    // User shooting state
-    fire_bullets: bool,
-    fire_cooldown: f64,
+#[wasm_bindgen]
+pub struct PoissonDisk {
+    width: u32,
+    height: u32,
+    cell_size: f64,
+    cell_width: f64,
+    cell_height: f64,
+    cells: Vec<Cell>,
+    radius: u32,
+    num_samples: u32,
+    // Grid used to determine point sampling.
+    grid: Vec<Option<(usize, usize)>>,
+    // List of points we want to generate more points around.
+    active: Vec<(usize, usize)>,
+    samples: Vec<Point>,
 }
 
-pub struct App<'a> {
-    pub window: config::GraphicsConfig,
-    glyph_cache: GlyphCache<'a>,
-    player: Player,
-    enemies: Vec<Enemy>,
-    bullets: Vec<Bullet>,
-    // Player score
-    score: u32,
-    // Game-wide events
-    state: GameState,
-}
+#[wasm_bindgen]
+impl PoissonDisk {
+    pub fn new(width: u32, height: u32, radius: u32, num_samples: u32) -> Self {
+        let cells = vec![Cell::EMPTY; (width * height) as usize];
 
-impl<'a> App<'a> {
-    pub fn new(window: config::GraphicsConfig) -> App<'a> {
-        let size = window.size;
+        // Step 0
+        // Initialize an n-dimensional background grid for storing samples
 
-        let (x, y) = (f64::from(size.width / 2),
-                      f64::from(size.height / 2));
+        // We choose cell size to be radius / (dimensions) so that we
+        // are guaranteed to have at most one point in any given cell.
+        let cell_size = radius as f64 / (2.0 as f64).sqrt();
+        let cell_width = (width as f64 / cell_size).ceil() + 1.0;
+        let cell_height = (height as f64 / cell_size).ceil() + 1.0;
+        let grid = vec![None; (cell_width * cell_height) as usize];
 
-        let player = Player::new(x, y);
-
-        let state = GameState {
-            debug_mode: false,
-            fire_bullets: false,
-            fire_cooldown: 0.0,
-            game_status: GameStatus::Normal,
+        let mut disk = PoissonDisk {
+            width,
+            height,
+            cells,
+            cell_size,
+            cell_width,
+            cell_height,
+            grid,
+            radius,
+            num_samples,
+            active: Vec::new(),
+            samples: Vec::new(),
         };
 
-        // Load font(s) used in the game.
-        let glyph_cache = GlyphCache::new("./assets/fonts/PxPlus_IBM_VGA8.ttf", (), TextureSettings::new())
-            .expect("Unable to load font");
+        // Step 1
+        // Select the initial sample to be randomly chosen uniformly in the domain.
+        let point = (
+            (Math::random() * width as f64) as usize,
+            (Math::random() * height as f64) as usize,
+        );
 
-        App {
-            glyph_cache,
-            player,
-            state,
-            window,
-            bullets: Vec::new(),
-            enemies: Vec::new(),
-            score: 0,
-        }
+        disk.insert_point(point);
+        disk.active.push(point);
+
+        disk
     }
 
-    fn reset(&mut self) {
-        self.state.game_status = GameStatus::Normal;
-        self.score = 0;
-        self.enemies.clear();
+    fn distance(&self, pa: (usize, usize), pb: (usize, usize)) -> f64 {
+        let dx = pa.0 as f64 - pb.0 as f64;
+        let dy = pa.1 as f64 - pb.1 as f64;
+
+        (dx * dx + dy * dy).sqrt()
     }
 
-    pub fn input(&mut self, button: &Button, is_press: bool) {
-        match (&button, is_press) {
-            (Button::Keyboard(key), true) => {
-                match key {
-                    Key::Up => self.player.start_move(geom::Direction::NORTH),
-                    Key::Down => self.player.start_move(geom::Direction::SOUTH),
-                    Key::Left => self.player.start_move(geom::Direction::WEST),
-                    Key::Right => self.player.start_move(geom::Direction::EAST),
-                    Key::Space => {
-                        if self.state.fire_cooldown <= 0.0 {
-                            self.state.fire_cooldown = FIRE_COOLDOWN;
-                            self.state.fire_bullets = true;
-                        }
+    fn is_valid(&self, point: (usize, usize)) -> bool {
+        let xidx = (point.0 as f64 / self.cell_size).floor();
+        let yidx = (point.1 as f64 / self.cell_size).floor();
+
+        let start_x = (xidx - 2.0).max(0.0) as usize;
+        let end_x = (xidx + 2.0).min(self.cell_width - 1.0) as usize;
+        let start_y = (yidx - 2.0).max(0.0) as usize;
+        let end_y = (yidx + 2.0).min(self.cell_height - 1.0) as usize;
+
+        for x in start_x..end_x {
+            for y in start_y..end_y {
+                let cell_idx = y * self.cell_width as usize + x;
+                if let Some(grid_point) = self.grid[cell_idx] {
+                    if self.distance(point, grid_point) <= self.radius.into() {
+                        return false;
                     }
-                    // Toggle debug mode.
-                    Key::D => {
-                        self.state.debug_mode = !self.state.debug_mode;
-                        println!("Debug mode: {}", self.state.debug_mode);
-                    }
-                    // Reset game
-                    Key::Return => {
-                        match self.state.game_status {
-                            GameStatus::Died => self.reset(),
-                            GameStatus::Win => self.reset(),
-                            _ => (),
-                        }
-                    }
-                    _ => (),
                 }
             }
-            (Button::Keyboard(key), false) => {
-                match key {
-                    Key::Up => self.player.stop_move(geom::Direction::NORTH),
-                    Key::Down => self.player.stop_move(geom::Direction::SOUTH),
-                    Key::Left => self.player.stop_move(geom::Direction::WEST),
-                    Key::Right => self.player.stop_move(geom::Direction::EAST),
-                    _ => (),
-                }
-            }
-            _ => {}
         }
+
+        true
     }
 
-    // Render stuff on the screen.
-    pub fn render(&mut self, args: &RenderArgs) {
-        // Grab list of objects to render.
-        let bullets = &self.bullets;
-        let enemies = &self.enemies;
-        let player = &self.player;
-        let gc = &mut self.glyph_cache;
-        let state = &self.state;
+    fn insert_point(&mut self, point: (usize, usize)) {
+        let cell_x = (point.0 as f64 / self.cell_size).floor();
+        let cell_y = (point.1 as f64 / self.cell_size).floor();
 
-        let debug_mode = self.state.debug_mode;
-        let score = self.score;
-        let size = self.window.size;
+        let idx = point.1 * self.width as usize + point.0;
+        self.cells[idx] = Cell::ACTIVE;
 
-        // Render stuff.
-        self.window.gl.draw(args.viewport(), |c, gl| {
-            use graphics::*;
-
-            // Clear the screen.
-            clear(crate::color::BLACK, gl);
-
-            // Check game status
-            match state.game_status {
-                GameStatus::Died => {
-                    draw_center("YOU DIED!", 32, [f64::from(size.width), f64::from(size.height)], gc, &c, gl);
-                    return;
-                }
-                GameStatus::Win => {
-                    draw_center("YOU WIN!", 32, [f64::from(size.width), f64::from(size.height)], gc, &c, gl);
-                    return;
-                }
-                _ => (),
-            }
-
-            // Render the current score
-            let score_str = format!("Score: {}", score);
-            draw_text(score_str.as_str(), [0.0, 16.0], 16, gc, &c, gl);
-
-            // Render objects
-            for bullet in bullets.iter() {
-                bullet.render(&c, gl);
-            }
-
-            for enemy in enemies.iter() {
-                enemy.render(&c, gl);
-            }
-
-            player.render(&c, gl);
-
-            if debug_mode {
-                player.render_dbg(&c, gl);
-            }
-        });
+        let cell_idx = (cell_y * self.cell_width + cell_x) as usize;
+        self.grid[cell_idx] = Some(point);
     }
 
-    // Update any animation, etc.
-    // dt is the delta since the last update.
-    pub fn update(&mut self, args: UpdateArgs) {
-        match self.state.game_status {
-            GameStatus::Died => return,
-            GameStatus::Win => return,
-            _ => (),
+    fn new_point(&mut self, point: (usize, usize)) -> (usize, usize) {
+        let theta = 2.0 * PI * Math::random();
+        // Pick a random radius between `r` and `2r`
+        let new_radius = self.radius as f64 * (Math::random() + 1.0);
+        // Find new coordinates relative to point p.
+        let new_x = point.0 as f64 + new_radius * theta.cos();
+        let new_y = point.1 as f64 + new_radius * theta.sin();
+
+        (
+            new_x.max(0.0).min(self.width as f64 - 1.0) as usize,
+            new_y.max(0.0).min(self.height as f64 - 1.0) as usize,
+        )
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn num_points(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn point_at_idx(&self, idx: usize) -> Point {
+        let point = &self.samples[idx];
+        Point(point.0, point.1)
+    }
+
+    pub fn reset(&mut self) {
+        self.active.clear();
+        self.grid.clear();
+        self.samples.clear();
+
+        let point = (
+            (Math::random() * self.width as f64) as usize,
+            (Math::random() * self.height as f64) as usize,
+        );
+
+        self.insert_point(point);
+        self.active.push(point);
+    }
+
+    pub fn tick(&mut self) -> bool {
+        // While the active list is not empty, choose a random index.
+        if self.active.is_empty() {
+            return false;
         }
 
-        let size = self.window.size;
+        // Choose a point randomly from active list
+        let idx = (Math::random() * (self.active.len() - 1) as f64) as usize;
+        let point = self.active[idx];
 
-        // Handle game events
-        if self.state.fire_cooldown > 0.0 {
-            self.state.fire_cooldown -= args.dt;
-        }
-
-        if self.state.fire_bullets {
-            self.state.fire_bullets = false;
-            self.bullets.push(
-                Bullet::new(self.player.pos.x, self.player.pos.y, self.player.dir)
-            );
-        }
-
-        for bullet in &mut self.bullets {
-            bullet.update(args.dt, size);
-            // Did bullet collide with any enemies
-            for enemy in &mut self.enemies {
-                if bullet.collides(enemy) {
-                    // Destroy bullet
-                    bullet.ttl = 0.0;
-                    // Destroy enemy
-                    enemy.health -= 1;
-                    self.score += 20;
-                }
+        // Generate up to `k` points chosen uniformly from the spherical
+        // annulus between radius `r` and `2r` around `x_{i}`.
+        let mut found = false;
+        for _ in 0..self.num_samples {
+            let new_point = self.new_point(point);
+            // Add the new point to the grid, active list, and to the
+            // final grid.
+            if self.is_valid(new_point) {
+                self.insert_point(new_point);
+                self.active.push(new_point);
+                self.samples.push(Point(new_point.0, new_point.1));
+                found = true;
             }
         }
-        // Remove bullets that have outlived their TTL
-        self.bullets.retain(|bullet| bullet.ttl > 0.0);
-        self.enemies.retain(|enemy| enemy.health > 0);
-        // Update player & enemies
-        self.player.update(args.dt, size);
-        // If number of enemies is zero... spawn more!
-        if self.enemies.is_empty() {
-            let size = self.window.size;
-            for _ in 0..10 {
-                self.enemies.push(Enemy::new_rand(f64::from(size.width), f64::from(size.height)));
-            }
+
+        if !found {
+            self.active.remove(idx);
+            let cidx = point.1 * self.width as usize + point.0;
+            self.cells[cidx] = Cell::DEAD;
         }
 
-        for enemy in &mut self.enemies {
-            enemy.update(args.dt, size);
-            // If the player collides with an enemy, game over!
-            if enemy.collides(&self.player) {
-                self.state.game_status = GameStatus::Died;
-            }
-        }
-        // Did we kill all the enemies?
-        if self.score == 100 {
-            self.state.game_status = GameStatus::Win;
-        }
+        true
     }
 }
